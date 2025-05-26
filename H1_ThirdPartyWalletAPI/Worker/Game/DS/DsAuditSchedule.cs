@@ -1,0 +1,144 @@
+﻿using System;
+using System.Collections.Generic;
+using System.Threading.Tasks;
+using Coravel.Invocable;
+using H1_ThirdPartyWalletAPI.Code;
+using H1_ThirdPartyWalletAPI.Model.DataModel;
+using H1_ThirdPartyWalletAPI.Model.Game.DS.Response;
+using H1_ThirdPartyWalletAPI.Model.W1API;
+using H1_ThirdPartyWalletAPI.Service;
+using Microsoft.Extensions.Logging;
+using H1_ThirdPartyWalletAPI.Service.Game;
+using H1_ThirdPartyWalletAPI.Service.Common;
+using H1_ThirdPartyWalletAPI.Service.Common.DB.Betlogs;
+
+namespace H1_ThirdPartyWalletAPI.Worker
+{
+    /// <summary>
+    /// 每小時檢查 DS 注單資料排程
+    /// </summary>
+    public class DsAuditSchedule : IInvocable
+    {
+        private readonly ILogger<DsAuditSchedule> _logger;
+        private readonly IGameApiService _gameApiService;
+        private readonly ICommonService _commonService;
+        private readonly IRepairBetRecordService _repairBetRecordService;
+        private readonly ISystemParameterDbService _systemParameterDbService;
+        private readonly IGameReportDBService _gameReportDBService;
+
+        public DsAuditSchedule(ILogger<DsAuditSchedule> logger, IGameApiService gameApiService, ICommonService commonService, IRepairBetRecordService repairBetRecordService, ISystemParameterDbService systemParameterDbService, IGameReportDBService gameReportDBService)
+        {
+            _logger = logger;
+            _gameApiService = gameApiService;
+            _commonService = commonService;
+            _repairBetRecordService = repairBetRecordService;
+            _systemParameterDbService = systemParameterDbService;
+            _gameReportDBService = gameReportDBService;
+        }
+
+        /// <summary>
+        /// 流程大綱
+        /// 1. 比對轉帳中心與遊戲商的匯總帳是否一致
+        /// 2. 如果帳務不一致的話，啟動補單機制
+        /// 3. 將最後匯總結果寫回 DB
+        /// </summary>
+        /// <returns></returns>
+        public async Task Invoke()
+        {
+            using var loggerScope = _logger.BeginScope(new Dictionary<string, object>()
+                {
+                    { "Schedule", this.GetType().Name },
+                    { "ScheduleExecId", Guid.NewGuid().ToString() }
+                });
+            _logger.LogInformation("Invoke DsAuditSchedule on time : {time}", DateTime.Now);
+
+
+            try
+            {
+                t_system_parameter parameter = null;
+                // 取得當前時間，計算下一個帳務比對的時間
+                var now = DateTime.Now.ToLocalTime();
+                now = now.AddHours(-2);
+                var nextTime = new DateTime(now.Year, now.Month, now.Day, now.Hour, 0, 0);
+                var key = "DsAuditSchedule";
+
+                // 取得帳務比對的時間基準
+                parameter = await _systemParameterDbService.GetSystemParameter(key);
+
+                // 檢查有無資料，沒資料的話新增預設值
+                if (parameter == null)
+                {
+                    var model = new t_system_parameter()
+                    {
+                        key = key,
+                        value = nextTime.ToString("yyyy-MM-dd HH:mm:ss"),
+                        min_value = string.Format("{0}", 1),
+                        name = "DS 每小時遊戲帳務比對排程",
+                        description = "DS 紀錄帳務比對排程時間基準點"
+                    };
+
+                    var postSystemParameter = await _systemParameterDbService.PostSystemParameter(model);
+                    if (postSystemParameter)
+                    {
+                        parameter = model;
+                    }
+                    else
+                    {
+                        return; // 新增失敗就結束排程
+                    }
+                }
+                else
+                {
+                    if (int.Parse(parameter.min_value) == 0)
+                    {
+                        _logger.LogInformation("ds audit schedule stop time: {time}", parameter.value);
+                        await Task.CompletedTask;
+                        return;
+                    }
+                    if (Convert.ToDateTime(parameter.value) < nextTime)
+                    {
+                        var lastReportTime = Convert.ToDateTime(parameter.value);
+                        parameter.value = lastReportTime.AddHours(1).ToString("yyyy-MM-dd HH:mm:ss");
+                    }
+                    else
+                    {
+                        _logger.LogInformation("return ds audit schedule current Time : {now} report time : {report time} ", now, parameter.value);
+                        return; // 時間不變就結束排程
+                    }
+                }
+
+                var StartTime = Convert.ToDateTime(parameter.value);
+                var EndTime = Convert.ToDateTime(parameter.value).AddHours(1);
+                // 遊戲商的匯總帳
+                var pgReportSummary = await _gameReportDBService.GetGameReportSummary(Platform.DS,
+                    ((int)GameReport.e_report_type.FinancalReport).ToString(),
+                    StartTime,
+                    EndTime);
+                // 轉帳中心的匯總帳
+                var w1ReportSummary = await _gameReportDBService.GetGameReportSummary(Platform.DS,
+                    ((int)GameReport.e_report_type.GameBetRecord).ToString(),
+                    StartTime,
+                    EndTime);
+
+                // 比對遊戲商與轉帳中心的匯總帳
+                if (pgReportSummary[0].total_netwin != w1ReportSummary[0].total_netwin)
+                {
+                    await _repairBetRecordService.RepairGameRecord(new RepairBetSummaryReq()
+                    {
+                        game_id = Platform.DS.ToString(),
+                        StartTime = Convert.ToDateTime(parameter.value),
+                        EndTime = Convert.ToDateTime(parameter.value).AddHours(1).AddSeconds(-1)
+                    });
+                }
+                // 查詢時間寫回 DB
+                await _systemParameterDbService.PutSystemParameter(parameter);
+            }
+            catch (Exception ex)
+            {            
+                var errorLine = new System.Diagnostics.StackTrace(ex, true).GetFrame(0).GetFileLineNumber();
+                var errorFile = new System.Diagnostics.StackTrace(ex, true).GetFrame(0).GetFileName();
+                _logger.LogError("Run ds audit schedule exception EX : {ex}  MSG : {Message}  Error Line : {errorFile}.{errorLine}", ex.GetType().FullName, ex.Message, errorFile, errorLine);
+            }
+        }
+    }
+}
